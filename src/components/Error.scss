@@ -7,3 +7,15 @@
 #critical-error-bz-report-modal-details {
   font-family: var(--pf-t--global--font--family--mono);
 }
+
+#critical-error-bz-report-modal-review-log-alert {
+  margin-bottom: var(--pf-v5-global--FontSize--sm);
+}
+
+.bz-log-link {
+  text-decoration: none;
+
+  &__icon {
+    margin-right: 0.3em;
+  }
+}

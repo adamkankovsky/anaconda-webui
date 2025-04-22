@@ -25,12 +25,11 @@ import {
     ContentVariants,
     Form,
     FormGroup,
-    FormHelperText,
-    HelperText,
     HelperTextItem,
+    List,
+    ListItem,
     Stack,
-    StackItem,
-    TextArea
+    StackItem
 } from "@patternfly/react-core";
 import {
     Modal,
@@ -104,7 +103,7 @@ export const BZReportModal = ({
 }) => {
     const [logContent, setLogContent] = useState();
     const [preparingReport, setPreparingReport] = useState(false);
-    const isBootIso = useContext(SystemTypeContext).systemType === "BOOT_ISO";
+    const isBootIso = useContext(SystemTypeContext) === "BOOT_ISO";
 
     useEffect(() => {
         cockpit.spawn(["journalctl", "-a"])
@@ -141,16 +140,9 @@ export const BZReportModal = ({
           showClose={false}
           title={title}
           titleIconVariant={titleIconVariant}
-          variant={ModalVariant.large}
+          variant={ModalVariant.small}
           footer={
               <Stack hasGutter>
-                  <FormHelperText>
-                      <HelperText>
-                          {isConnected
-                              ? <HelperTextItem> {_("Reporting an issue will send information over the network. Please review and edit the attached log to remove any sensitive information.")} </HelperTextItem>
-                              : <HelperTextItem icon={<DisconnectedIcon />}> {isBootIso ? networkHelperMessageBootIso : networkHelperMessageLive} </HelperTextItem>}
-                      </HelperText>
-                  </FormHelperText>
                   <StackItem>
                       <ActionList>
                           <Button
@@ -169,24 +161,32 @@ export const BZReportModal = ({
           }>
             <Form>
                 {detailsLabel &&
-                <FormGroup
-                  fieldId={idPrefix + "-bz-report-modal-details"}
-                  label={detailsLabel}
-                >
-                    {detailsContent}
-                </FormGroup>}
-                <FormGroup
-                  fieldId={idPrefix + "-bz-report-modal-review-log"}
-                  label={_("Log")}
-                >
-                    <TextArea
-                      value={logContent}
-                      onChange={(_, value) => setLogContent(value)}
-                      resizeOrientation="vertical"
-                      id={idPrefix + "-bz-report-modal-review-log"}
-                      isAriaDisabled={logContent === undefined || preparingReport}
-                      rows={25}
-                    />
+                    <FormGroup
+                      fieldId={idPrefix + "-bz-report-modal-details"}
+                      label={detailsLabel}
+                    >
+                        {detailsContent}
+                    </FormGroup>}
+                <FormGroup>
+                    {isConnected
+                        ? (
+                            <List>
+                                <ListItem>
+                                    {_("System log saved to")} <strong>{logFile}</strong>
+                                </ListItem>
+                                <ListItem>
+                                    {_("Review and edit the file to remove sensitive information")}
+                                </ListItem>
+                                <ListItem>
+                                    {_("Please manually attach this log file to your Bugzilla report")}
+                                </ListItem>
+                            </List>
+                        )
+                        : (
+                            <HelperTextItem icon={<DisconnectedIcon />}>
+                                {isBootIso ? networkHelperMessageBootIso : networkHelperMessageLive}
+                            </HelperTextItem>
+                        )}
                 </FormGroup>
             </Form>
         </Modal>
@@ -276,7 +276,6 @@ const cancelButton = (onClose) => {
 export const UserIssue = ({ isConnected, reportLinkURL, setIsReportIssueOpen }) => {
     return (
         <BZReportModal
-          description={_("The following log will be sent to the issue tracking system where you may provide additional details.")}
           reportLinkURL={reportLinkURL}
           idPrefix="user-issue"
           title={_("Report issue")}
