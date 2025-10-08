@@ -9,41 +9,51 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: prs-to-slack
+  cancel-in-progress: true
 
 jobs:
   post-ready-prs:
     runs-on: ubuntu-latest
     env:
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      SLACK_WORKFLOW_WEBHOOK_URL: ${{ secrets.SLACK_WORKFLOW_WEBHOOK_URL }} # <-- ulož sem tvoji URL
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Ensure jq and gh are available
+      - name: Guard – missing webhook
+        if: env.SLACK_WORKFLOW_WEBHOOK_URL == ''
+        run: |
+          echo "Secret SLACK_WORKFLOW_WEBHOOK_URL is not set. Skipping."
+          exit 0
+
+      - name: Install jq & gh
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq
-          if ! command -v gh >/dev/null 2>&1; then
-            type -p curl >/dev/null || (sudo apt-get update && sudo apt-get install -y curl)
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-            sudo apt-get update -y && sudo apt-get install -y gh
-          fi
+          sudo apt-get install -y jq gh
 
-      - name: Collect PRs (open & not draft)
+      - name: Collect PRs (open & not draft) + checks summary
         id: collect
+        shell: bash
         run: |
           set -euo pipefail
           REPO="${{ github.repository }}"
-          PRS="$(gh api "/repos/${REPO}/pulls?state=open&per_page=100" --paginate \
-            | jq -r '.[] | select(.draft==false) | @base64')"
 
-          if [ -z "$PRS" ]; then
-            echo "text=*Good morning!* No open PRs ready for review today." >> $GITHUB_OUTPUT
+          # Pull all open, non-draft PRs (paginate)
+          mapfile -t PRS < <(gh api "/repos/${REPO}/pulls?state=open&per_page=100" --paginate \
+            | jq -r '.[] | select(.draft==false) | @base64')
+
+          if [ ${#PRS[@]} -eq 0 ]; then
+            MSG="*Good morning!* No open PRs ready for review today."
+            printf '%s' "$MSG" | jq -Rs --arg k "text" '{($k): .}' \
+              | sed 's/"text"/"pr-review"/' > /tmp/payload.json
+            echo "payload=$(cat /tmp/payload.json | base64 -w0)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           MSG="*Good morning!* PRs ready for review in <${{ github.server_url }}/${REPO}|${REPO}>:\n"
-          while IFS= read -r b64; do
             row="$(echo "$b64" | base64 -d)"
             number="$(echo "$row" | jq -r '.number')"
             title="$(echo "$row" | jq -r '.title')"
@@ -51,18 +61,39 @@ jobs:
             author="$(echo "$row" | jq -r '.user.login')"
             reviewers="$(echo "$row" | jq -r '[.requested_reviewers[].login] | join(", ")')"
             [ -z "$reviewers" ] && reviewers="(no reviewers requested)"
-            MSG+="- <${url}|#${number}> ${title} — by *${author}* — reviewers: ${reviewers}\n"
-          done <<< "$PRS"
+            sha="$(echo "$row" | jq -r '.head.sha')"
 
-          MSG_ESCAPED="${MSG//'%'/'%25'}"
-          MSG_ESCAPED="${MSG_ESCAPED//$'\n'/'%0A'}"
-          MSG_ESCAPED="${MSG_ESCAPED//$'\r'/'%0D'}"
-          echo "text=$MSG_ESCAPED" >> $GITHUB_OUTPUT
+            # Prefer GitHub Checks API; fallback to combined Status API if no check-runs
+            chk_json="$(gh api -H 'Accept: application/vnd.github+json' "/repos/${REPO}/commits/${sha}/check-runs?per_page=100")"
+            total_chk="$(jq -r '.check_runs | length' <<<"$chk_json")"
 
-      - name: Post to Slack
-        if: env.SLACK_WEBHOOK_URL != ''
+            if [ "$total_chk" -gt 0 ]; then
+              success="$(jq -r '[.check_runs[] | select(.status=="completed" and .conclusion=="success")] | length' <<<"$chk_json")"
+              failed="$(jq -r '[.check_runs[] | select(.status=="completed" and (.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="cancelled" or .conclusion=="action_required"))] | length' <<<"$chk_json")"
+              pending="$(jq -r '[.check_runs[] | select(.status!="completed")] | length' <<<"$chk_json")"
+              checks="checks: ${success}✓ / ${failed}✖ / ${pending}⏳"
+            else
+              # Combined status contexts (success/failure/pending)
+              stat_json="$(gh api "/repos/${REPO}/commits/${sha}/status")"
+              state="$(jq -r '.state' <<<"$stat_json")"  # success | failure | pending | error
+              ctxs="$(jq -r '.statuses' <<<"$stat_json")"
+              ok="$(jq -r '[.[] | select(.state=="success")] | length' <<<"$ctxs")"
+              ko="$(jq -r '[.[] | select(.state=="failure" or .state=="error")] | length' <<<"$ctxs")"
+              pd="$(jq -r '[.[] | select(.state=="pending")] | length' <<<"$ctxs")"
+              checks="status: *${state}* (${ok}✓ / ${ko}✖ / ${pd}⏳)"
+            fi
+
+            MSG+="- <${url}|#${number}> ${title} — by *${author}* — reviewers: ${reviewers} — ${checks}\n"
+          done
+
+          # Build Slack Workflow payload with your input field "pr-review"
+          printf '%s' "$MSG" | jq -Rs '{("pr-review"): .}' > /tmp/payload.json
+          echo "payload=$(cat /tmp/payload.json | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - name: Post to Slack (Workflow Webhook)
+        env:
+          SLACK_WORKFLOW_WEBHOOK_URL: ${{ secrets.SLACK_WORKFLOW_WEBHOOK_URL }}
         run: |
-          set -euo pipefail
-          jq -n --arg text "${{ steps.collect.outputs.text }}" '{text:$text}' \
-            | curl -sS -X POST -H 'Content-type: application/json' \
-              --data @- "$SLACK_WEBHOOK_URL"
+          echo "${{ steps.collect.outputs.payload }}" | base64 -d \
+            | curl -sS -X POST -H 'Content-Type: application/json' \
+              --data @- "$SLACK_WORKFLOW_WEBHOOK_URL"
