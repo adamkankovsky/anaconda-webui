@@ -1,0 +1,68 @@
+name: Daily PRs to Slack (ready for review)
+
+on:
+  schedule:
+    # Weekdays at 07:00 UTC ≈ 09:00 Europe/Prague
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  post-ready-prs:
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Ensure jq and gh are available
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+          if ! command -v gh >/dev/null 2>&1; then
+            type -p curl >/dev/null || (sudo apt-get update && sudo apt-get install -y curl)
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update -y && sudo apt-get install -y gh
+          fi
+
+      - name: Collect PRs (open & not draft)
+        id: collect
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          PRS="$(gh api "/repos/${REPO}/pulls?state=open&per_page=100" --paginate \
+            | jq -r '.[] | select(.draft==false) | @base64')"
+
+          if [ -z "$PRS" ]; then
+            echo "text=*Good morning!* No open PRs ready for review today." >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          MSG="*Good morning!* PRs ready for review in <${{ github.server_url }}/${REPO}|${REPO}>:\n"
+          while IFS= read -r b64; do
+            row="$(echo "$b64" | base64 -d)"
+            number="$(echo "$row" | jq -r '.number')"
+            title="$(echo "$row" | jq -r '.title')"
+            url="$(echo "$row" | jq -r '.html_url')"
+            author="$(echo "$row" | jq -r '.user.login')"
+            reviewers="$(echo "$row" | jq -r '[.requested_reviewers[].login] | join(", ")')"
+            [ -z "$reviewers" ] && reviewers="(no reviewers requested)"
+            MSG+="- <${url}|#${number}> ${title} — by *${author}* — reviewers: ${reviewers}\n"
+          done <<< "$PRS"
+
+          MSG_ESCAPED="${MSG//'%'/'%25'}"
+          MSG_ESCAPED="${MSG_ESCAPED//$'\n'/'%0A'}"
+          MSG_ESCAPED="${MSG_ESCAPED//$'\r'/'%0D'}"
+          echo "text=$MSG_ESCAPED" >> $GITHUB_OUTPUT
+
+      - name: Post to Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          set -euo pipefail
+          jq -n --arg text "${{ steps.collect.outputs.text }}" '{text:$text}' \
+            | curl -sS -X POST -H 'Content-type: application/json' \
+              --data @- "$SLACK_WEBHOOK_URL"
