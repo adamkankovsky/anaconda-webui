@@ -1,0 +1,104 @@
+name: Daily PRs to Slack (ready for review)
+
+on:
+  schedule:
+    # Weekdays at 07:00 UTC ≈ 09:00 Europe/Prague
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: prs-to-slack
+  cancel-in-progress: true
+
+jobs:
+  post-ready-prs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SLACK_WORKFLOW_WEBHOOK_URL: ${{ secrets.SLACK_WORKFLOW_WEBHOOK_URL }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Guard – missing webhook
+        if: env.SLACK_WORKFLOW_WEBHOOK_URL == ''
+        run: |
+          echo "Secret SLACK_WORKFLOW_WEBHOOK_URL is not set. Skipping."
+          exit 0
+
+      - name: Install jq & gh
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq gh
+
+      - name: Collect PRs (open & not draft) + checks summary
+        id: collect
+        shell: bash
+        run: |
+          # nounset-safe (no -u)
+          set -eE -o pipefail
+          REPO="${{ github.repository }}"
+
+          # Fetch all open PRs (paginate) and filter out drafts
+          mapfile -t PRS < <(gh api "/repos/${REPO}/pulls?state=open&per_page=100" --paginate \
+            | jq -r '.[] | select(.draft==false) | @base64')
+
+          if [[ ${#PRS[@]} -eq 0 ]]; then
+            MSG="*Good morning!* No open PRs ready for review today."
+            printf '%s' "$MSG" | jq -Rs '{("pr-review"): .}' > /tmp/payload.json
+            echo "payload=$(base64 -w0 /tmp/payload.json)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          MSG="*Good morning!* PRs ready for review in <${{ github.server_url }}/${REPO}|${REPO}>:\n"
+
+          # Initialize loop variable for nounset safety
+          b64=""
+          for b64 in "${PRS[@]}"; do
+            row="$(printf '%s' "$b64" | base64 -d)"
+            number="$(jq -r '.number' <<<"$row")"
+            title="$(jq -r '.title' <<<"$row")"
+            url="$(jq -r '.html_url' <<<"$row")"
+            author="$(jq -r '.user.login' <<<"$row")"
+            reviewers="$(jq -r '[.requested_reviewers[].login] | join(", ")' <<<"$row")"
+            [[ -z "$reviewers" ]] && reviewers="(no reviewers requested)"
+            sha="$(jq -r '.head.sha' <<<"$row")"
+
+            # Prefer Checks API; fallback to combined Status API
+            chk_json="$(gh api -H 'Accept: application/vnd.github+json' "/repos/${REPO}/commits/${sha}/check-runs?per_page=100" 2>/dev/null || echo '{"check_runs":[]}')"
+            total_chk="$(jq -r '.check_runs | length' <<<"$chk_json")"
+
+            if [[ "$total_chk" -gt 0 ]]; then
+              success="$(jq -r '[.check_runs[] | select(.status=="completed" and .conclusion=="success")] | length' <<<"$chk_json")"
+              failed="$(jq -r '[.check_runs[] | select(.status=="completed" and (.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="cancelled" or .conclusion=="action_required"))] | length' <<<"$chk_json")"
+              pending="$(jq -r '[.check_runs[] | select(.status!="completed")] | length' <<<"$chk_json")"
+              checks="checks: ${success}✓ / ${failed}✖ / ${pending}⏳"
+            else
+              stat_json="$(gh api "/repos/${REPO}/commits/${sha}/status" 2>/dev/null || echo '{"state":"pending","statuses":[]}')"
+              state="$(jq -r '.state' <<<"$stat_json")"  # success | failure | pending | error
+              ctxs="$(jq -r '.statuses' <<<"$stat_json")"
+              ok="$(jq -r '[.[] | select(.state=="success")] | length' <<<"$ctxs")"
+              ko="$(jq -r '[.[] | select(.state=="failure" or .state=="error")] | length' <<<"$ctxs")"
+              pd="$(jq -r '[.[] | select(.state=="pending")] | length' <<<"$ctxs")"
+              checks="status: *${state}* (${ok}✓ / ${ko}✖ / ${pd}⏳)"
+            fi
+
+            MSG+="- <${url}|#${number}> ${title} — by *${author}* — reviewers: ${reviewers} — ${checks}\n"
+          done
+
+          # Build Slack Workflow payload using your input key "pr-review"
+          printf '%s' "$MSG" | jq -Rs '{("pr-review"): .}' > /tmp/payload.json
+          echo "payload=$(base64 -w0 /tmp/payload.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Post to Slack (Workflow Webhook)
+        env:
+          SLACK_WORKFLOW_WEBHOOK_URL: ${{ secrets.SLACK_WORKFLOW_WEBHOOK_URL }}
+        run: |
+          echo "${{ steps.collect.outputs.payload }}" | base64 -d \
+            | curl -sS -X POST -H 'Content-Type: application/json' \
+              --data @- "$SLACK_WORKFLOW_WEBHOOK_URL"
