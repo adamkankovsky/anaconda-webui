@@ -1,0 +1,115 @@
+# Single-message PR reminder to Slack (no threads).
+# See docs/slack-pr-reminder-plan.md for design.
+
+name: Daily PR reminder to Slack
+
+on:
+  schedule:
+    # Weekdays at 07:00 UTC ≈ 09:00 Europe/Prague
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: prs-to-slack
+  cancel-in-progress: true
+
+jobs:
+  post-prs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WORKFLOW_WEBHOOK_URL: ${{ secrets.WORKFLOW_WEBHOOK_URL }}
+
+    steps:
+      - name: Guard – missing webhook URL
+        run: |
+          set -e
+          if [ -z "${WORKFLOW_WEBHOOK_URL}" ]; then
+            echo "WORKFLOW_WEBHOOK_URL not set. Skipping."
+            exit 0
+          fi
+
+      - name: Collect PR counts and post single message to Slack
+        if: env.WORKFLOW_WEBHOOK_URL != ''
+        run: |
+          set -eE -o pipefail
+
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq jq gh
+
+          REPO="${{ github.repository }}"
+          BASE_URL="${{ github.server_url }}"
+          REPO_URL="${BASE_URL}/${REPO}"
+          # Link to PR list filtered: open, non-draft (ready for review)
+          PRS_READY_URL="${REPO_URL}/pulls?q=is%3Apr+is%3Aopen+draft%3Afalse"
+
+          # All open PRs (includes drafts)
+          mapfile -t OPEN_ALL < <(gh api "/repos/${REPO}/pulls?state=open&per_page=100" --paginate | jq -r '.[] | @base64')
+          OPEN_TOTAL="${#OPEN_ALL[@]}"
+
+          # Ready = not draft
+          READY_TOTAL=0
+          READY_WITH_REVIEW_REQ=0
+          for b64 in "${OPEN_ALL[@]}"; do
+            [ -z "$b64" ] && continue
+            row="$(printf '%s' "$b64" | base64 -d)"
+            if [ "$(jq -r '.draft' <<<"$row")" = "false" ]; then
+              READY_TOTAL=$((READY_TOTAL + 1))
+              rev_len="$(jq -r '.requested_reviewers | length' <<<"$row")"
+              [ "${rev_len:-0}" -gt 0 ] && READY_WITH_REVIEW_REQ=$((READY_WITH_REVIEW_REQ + 1))
+            fi
+          done
+
+          if echo "${WORKFLOW_WEBHOOK_URL}" | grep -q 'hooks\.slack\.com/services/'; then
+            # Incoming Webhook (optional): simple text
+            payload="$(jq -nc --arg txt "PR digest for ${REPO}: open=${OPEN_TOTAL}, ready=${READY_TOTAL} (${READY_WITH_REVIEW_REQ} with reviewers)" '{text:$txt}')"
+          else
+            # Workflow trigger: only the defined inputs; Slack builds the message
+            payload="$(jq -nc \
+              --arg repo "$REPO" \
+              --arg open_prs "$OPEN_TOTAL" \
+              --arg ready_prs "$READY_TOTAL" \
+              --arg ready_with_reviewers "$READY_WITH_REVIEW_REQ" \
+              --arg pr_list_url "$PRS_READY_URL" \
+              '{repo:$repo, open_prs:$open_prs, ready_prs:$ready_prs, ready_with_reviewers:$ready_with_reviewers, pr_list_url:$pr_list_url}')"
+          fi
+
+          resp="$(curl -sS -w '\n%{http_code}' -X POST "${WORKFLOW_WEBHOOK_URL}" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            --data "$payload")"
+          http_code="$(echo "$resp" | tail -n1)"
+          body="$(echo "$resp" | sed '$d')"
+
+          if [ "$http_code" != "200" ]; then
+            echo "Slack webhook failed (HTTP ${http_code})."
+            echo "$body" | head -c 500
+            exit 1
+          fi
+          if [ "$body" = "ok" ]; then
+            echo "Posted PR reminder to Slack."
+            exit 0
+          fi
+          if printf '%s' "$body" | jq -e '.ok == true' >/dev/null 2>&1; then
+            echo "Posted PR reminder to Slack."
+            exit 0
+          fi
+          if echo "$body" | grep -qE '<!DOCTYPE|shortcuts/|glitch'; then
+            echo "Slack returned a web page instead of accepting the webhook."
+            echo "WORKFLOW_WEBHOOK_URL must be a real webhook URL, not a link to open in the browser."
+            echo "  - Incoming Webhook: use the URL from Slack (Apps → Incoming Webhooks), e.g. https://hooks.slack.com/services/..."
+            echo "  - Workflow with Webhook trigger: use the URL from the workflow’s Webhook trigger (hooks.slack.com/triggers/...), not the shortcut link (slack.com/shortcuts/...)."
+            exit 1
+          fi
+          if echo "$body" | grep -qi 'invalid_blocks'; then
+            echo "Slack returned invalid_blocks (from Workflow Builder Send a message step, not this script)."
+            echo "Fix: Use Incoming Webhook URL as WORKFLOW_WEBHOOK_URL: Slack → channel → Integrations → Incoming Webhooks → copy hooks.slack.com/services/... URL."
+            echo "Or in Workflow Builder: Send a message step → use only plain text + variables, no Block Kit."
+            exit 1
+          fi
+          echo "Slack webhook failed: ${body:0:500}"
+          exit 1
