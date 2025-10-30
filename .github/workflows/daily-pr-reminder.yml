@@ -1,0 +1,192 @@
+name: Daily PRs to Slack (summary + threaded details)
+
+on:
+  schedule:
+    # Weekdays at 07:00 UTC ≈ 09:00 Europe/Prague
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: prs-to-slack
+  cancel-in-progress: true
+
+jobs:
+  post-prs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+
+    steps:
+      - name: Guard – missing Slack secrets
+        run: |
+          set -e
+          if [ -z "${SLACK_BOT_TOKEN}" ] || [ -z "${SLACK_CHANNEL_ID}" ]; then
+            echo "Slack configuration missing (SLACK_BOT_TOKEN or SLACK_CHANNEL_ID). Skipping."
+            exit 0
+          fi
+
+      - name: Install jq & gh
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq gh
+
+      - name: Collect PRs & counts
+        id: collect
+        shell: bash
+        run: |
+          set -eE -o pipefail
+
+          REPO="${{ github.repository }}"
+          BASE_URL="${{ github.server_url }}"
+          REPO_URL="${BASE_URL}/${REPO}"
+
+          # All open PRs (includes drafts)
+          mapfile -t OPEN_ALL < <(gh api "/repos/${REPO}/pulls?state=open&per_page=100" --paginate | jq -r '.[] | @base64')
+          OPEN_TOTAL="${#OPEN_ALL[@]}"
+
+          # Ready = not draft
+          mapfile -t READY < <(printf '%s\n' "${OPEN_ALL[@]}" | sed '/^$/d' | while read -r b64; do
+            row="$(printf '%s' "$b64" | base64 -d)"
+            jq -r 'select(.draft==false) | @base64' <<<"$row"
+          done)
+          READY_TOTAL="${#READY[@]}"
+
+          # "Review requested" (subset of READY with requested reviewers)
+          mapfile -t READY_RR < <(printf '%s\n' "${READY[@]}" | sed '/^$/d' | while read -r b64; do
+            row="$(printf '%s' "$b64" | base64 -d)"
+            jq -r 'select((.requested_reviewers | length) > 0) | @base64' <<<"$row"
+          done)
+          READY_WITH_REVIEW_REQ="${#READY_RR[@]}"
+
+          # Compose summary text
+          if [ "$OPEN_TOTAL" -eq 0 ]; then
+            SUMMARY="*PR summary for <${REPO_URL}|${REPO}>*\n• Open PRs: *0*\n• Ready for review: *0*"
+          else
+            SUMMARY="*PR summary for <${REPO_URL}|${REPO}>*\n• Open PRs: *${OPEN_TOTAL}*\n• Ready for review (non-draft): *${READY_TOTAL}* (of which *${READY_WITH_REVIEW_REQ}* have review requested)"
+          fi
+
+          # Post the parent message and capture thread_ts
+          resp="$(curl -sS -X POST 'https://slack.com/api/chat.postMessage' \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            --data "$(jq -nc --arg ch "$SLACK_CHANNEL_ID" --arg txt "$SUMMARY" \
+              '{channel:$ch, text:$txt, unfurl_links:false, unfurl_media:false}')" )"
+
+          ok="$(jq -r '.ok' <<<"$resp")"
+          if [ "$ok" != "true" ]; then
+            echo "Slack post failed: $resp"
+            exit 1
+          fi
+          ts="$(jq -r '.ts' <<<"$resp")"
+          echo "thread_ts=$ts" >> "$GITHUB_OUTPUT"
+
+          # Save READY list (base64 rows) to a temp file for the next step
+          printf '%s\n' "${READY[@]}" | sed '/^$/d' > /tmp/ready_b64.txt
+          echo "ready_count=${READY_TOTAL}" >> "$GITHUB_OUTPUT"
+          echo "repo_url=${REPO_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Post threaded details (one message per PR)
+        if: steps.collect.outputs.ready_count != '0'
+        env:
+          THREAD_TS: ${{ steps.collect.outputs.thread_ts }}
+        shell: bash
+        run: |
+          set -eE -o pipefail
+          REPO="${{ github.repository }}"
+
+          # Helper: humanize timestamp (yyyy-mm-dd -> "YYYY-MM-DD")
+          human_date() {
+            date -u -d "$1" +"%Y-%m-%d"
+          }
+
+          while IFS= read -r b64; do
+            row="$(printf '%s' "$b64" | base64 -d)"
+            number="$(jq -r '.number' <<<"$row")"
+            title="$(jq -r '.title' <<<"$row")"
+            url="$(jq -r '.html_url' <<<"$row")"
+            author="$(jq -r '.user.login' <<<"$row")"
+            created_at="$(jq -r '.created_at' <<<"$row")"
+            updated_at="$(jq -r '.updated_at' <<<"$row")"
+            reviewers="$(jq -r '[.requested_reviewers[].login] | join(", ")' <<<"$row")"
+            [ -z "$reviewers" ] && reviewers="(none)"
+
+            # Detailed PR info (labels, size, mergeability, files/additions/deletions)
+            pr_json="$(gh api "/repos/${REPO}/pulls/${number}")"
+            labels="$(jq -r '[.labels[].name] | join(", ")' <<<"$pr_json")"
+            [ -z "$labels" ] && labels="(none)"
+            additions="$(jq -r '.additions' <<<"$pr_json")"
+            deletions="$(jq -r '.deletions' <<<"$pr_json")"
+            files_changed="$(jq -r '.changed_files' <<<"$pr_json")"
+            mergeable_state="$(jq -r '.mergeable_state // "unknown"' <<<"$pr_json")"
+
+            # Size tag (quick heuristic)
+            total_delta=$(( additions + deletions ))
+            if   [ "$total_delta" -lt 100 ]; then size="S";
+            elif [ "$total_delta" -lt 500 ]; then size="M";
+            elif [ "$total_delta" -lt 2000 ]; then size="L";
+            else size="XL"; fi
+
+            # Reviews summary (approvals / changes-requested)
+            reviews_json="$(gh api "/repos/${REPO}/pulls/${number}/reviews?per_page=100" --paginate)"
+            approvals="$(jq -r '[.[] | select(.state=="APPROVED")] | length' <<<"$reviews_json")"
+            changes_req="$(jq -r '[.[] | select(.state=="CHANGES_REQUESTED")] | length' <<<"$reviews_json")"
+
+            # Checks summary for HEAD SHA
+            sha="$(jq -r '.head.sha' <<<"$row")"
+            chk_json="$(gh api -H 'Accept: application/vnd.github+json' "/repos/${REPO}/commits/${sha}/check-runs?per_page=100" 2>/dev/null || echo '{"check_runs":[]}')"
+            total_chk="$(jq -r '.check_runs | length' <<<"$chk_json")"
+            if [ "$total_chk" -gt 0 ]; then
+              success="$(jq -r '[.check_runs[] | select(.status=="completed" and .conclusion=="success")] | length' <<<"$chk_json")"
+              failed="$(jq -r '[.check_runs[] | select(.status=="completed" and (.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="cancelled" or .conclusion=="action_required"))] | length' <<<"$chk_json")"
+              pending="$(jq -r '[.check_runs[] | select(.status!="completed")] | length' <<<"$chk_json")"
+              checks="${success}✓ / ${failed}✖ / ${pending}⏳"
+            else
+              stat_json="$(gh api "/repos/${REPO}/commits/${sha}/status" 2>/dev/null || echo '{"state":"pending","statuses":[]}')"
+              okc="$(jq -r '[.statuses[] | select(.state=="success")] | length' <<<"$stat_json")"
+              koc="$(jq -r '[.statuses[] | select(.state=="failure" or .state=="error")] | length' <<<"$stat_json")"
+              pdc="$(jq -r '[.statuses[] | select(.state=="pending")] | length' <<<"$stat_json")"
+              checks="${okc}✓ / ${koc}✖ / ${pdc}⏳"
+            fi
+
+            # Mergeability icon
+            case "$mergeable_state" in
+              clean|has_hooks) merge_icon="✅";;
+              unstable|blocked) merge_icon="⏳";;
+              dirty|unknown) merge_icon="❗";;
+              *) merge_icon="❔";;
+            esac
+
+            created_fmt="$(human_date "$created_at")"
+            updated_fmt="$(human_date "$updated_at")"
+
+            # Compose thread message (compact, high-signal)
+            TEXT="$(cat <<EOF
+            *<${ url }|#${number}> — ${title}*
+            • *Author:* @${author}   • *Labels:* ${lab els}
+            • *Reviews:* ${approvals}✅ / ${changes_req}❌   • *Requested:* ${reviewers}
+            • *CI:* ${checks}   • *Mergeability:* ${merge_icon} \`(${mergeable_state})\`
+            • *Changes:* +${additions}/−${deletions} in ${files_changed} files  • *Size:* \`${size}\`
+            • *Updated:* ${updated_fmt}  • *Created:* ${created_fmt}
+            EOF
+            )"
+  
+          curl -sS -X POST 'https://slack.com/api/chat.postMessage' \
+          -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+          -H 'Content-Type: application/json; charset=utf-8' \
+            --data "$(jq -nc \
+            --arg ch "$SLACK_CHANNEL_ID" \
+            --arg ts "$THREAD_TS" \
+            --arg txt "$TEXT" \
+            '{channel:$ch, text:$txt, thread_ts:$ts, unfurl_links:false, unfurl_media:false}')" \
+            >/dev/null
+            
+          done
