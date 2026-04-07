@@ -516,52 +516,139 @@ class StorageScenario():
 
 
 class StorageReclaimDialog():
+    _TABLE = "#reclaim-space-modal-table"
+
     def __init__(self, browser):
         self.browser = browser
 
+    def _reclaim_js_each_row(self, device, rowIndex, body):
+        """Walk reclaim table rows. If rowIndex is set, it matches legacy CSS ``tbody:nth-child(rowIndex)``
+        (1-based index among the table's **direct** children), then ``tr`` containing ``device``.
+        If rowIndex is None, search all ``tbody tr``."""
+        tbl = json.dumps(self._TABLE)
+        dev = json.dumps(device)
+        nth_js = "null" if rowIndex is None else str(int(rowIndex))
+        return """(() => {
+          const table = document.querySelector(%s);
+          if (!table) return false;
+          const device = %s;
+          const tbodyNth = %s;
+          let rows;
+          if (tbodyNth === null) {
+            rows = table.querySelectorAll("tbody tr");
+          } else {
+            const child = table.children[tbodyNth - 1];
+            if (!child || child.tagName !== "TBODY") return false;
+            rows = child.querySelectorAll(":scope > tr");
+          }
+          for (let i = 0; i < rows.length; i++) {
+            const tr = rows[i];
+            if (!tr.textContent.includes(device)) continue;
+            %s
+          }
+          return false;
+        })()""" % (tbl, dev, nth_js, body)
+
+    def _reclaim_wait_row_button(self, device, aria_label, rowIndex=None, present=True, disabled=None):
+        """disabled: None = any, True = must be disabled, False = must be enabled."""
+        aria = json.dumps(aria_label)
+        inner = """
+            const ariaLabel = %s;
+            const btn = Array.from(tr.querySelectorAll("button")).find(
+              b => b.getAttribute("aria-label") === ariaLabel
+            );
+            if (!btn) continue;
+            const dis = btn.disabled || btn.getAttribute("aria-disabled") === "true";
+        """ % aria
+        if disabled is True:
+            inner += """
+            if (!dis) continue;
+            return true;
+            """
+        elif disabled is False:
+            inner += """
+            if (dis) continue;
+            return true;
+            """
+        else:
+            inner += "return true;\n"
+        cond = self._reclaim_js_each_row(device, rowIndex, inner)
+        if present:
+            self.browser.wait_js_cond(cond)
+        else:
+            self.browser.wait_js_cond("!(" + cond + ")")
+
+    def _reclaim_click_row_button(self, device, aria_label, rowIndex=None):
+        aria = json.dumps(aria_label)
+        inner = """
+            const ariaLabel = %s;
+            const btn = Array.from(tr.querySelectorAll("button")).find(
+              b => b.getAttribute("aria-label") === ariaLabel
+            );
+            if (!btn || btn.disabled || btn.getAttribute("aria-disabled") === "true") continue;
+            btn.click();
+            return true;
+        """ % aria
+        script = self._reclaim_js_each_row(device, rowIndex, inner)
+        self.browser.wait_js_cond(script)
+
     def reclaim_check_device_row(self, location, name=None, deviceType=None, space=None, locked=False):
-        self.browser.wait_visible(
-            "#reclaim-space-modal-table "
-            f"td[data-label=Location]:contains({location}) + " +
-            (f"td[data-label=Name]:contains({name}) + " if deviceType != "disk" else "") +
-            f"td[data-label=Type]:contains({deviceType}) + "
-            f"td[data-label=Space]:contains({space})"
-        )
+        loc = json.dumps(location or "")
+        nam = json.dumps("" if name is None else name)
+        dt = json.dumps(deviceType or "")
+        sp = json.dumps(space or "")
+        is_disk = "true" if deviceType == "disk" else "false"
+        cond = """(() => {
+          const table = document.querySelector(%s);
+          if (!table) return false;
+          const location = %s, name = %s, devType = %s, space = %s;
+          const isDisk = %s;
+          for (const tr of table.querySelectorAll("tbody tr")) {
+            const locEl = tr.querySelector('td[data-label="Location"]');
+            const nameEl = tr.querySelector('td[data-label="Name"]');
+            const typeEl = tr.querySelector('td[data-label="Type"]');
+            const spaceEl = tr.querySelector('td[data-label="Space"]');
+            if (!locEl || !typeEl || !spaceEl) continue;
+            if (!locEl.textContent.includes(location)) continue;
+            if (!isDisk && nameEl && !nameEl.textContent.includes(name)) continue;
+            if (!typeEl.textContent.includes(devType)) continue;
+            if (!spaceEl.textContent.includes(space)) continue;
+            return true;
+          }
+          return false;
+        })()""" % (json.dumps(self._TABLE), loc, nam, dt, sp, is_disk)
+        self.browser.wait_js_cond(cond)
         if locked:
-            self.browser.wait_visible(
-                f"#reclaim-space-modal-table tr:contains({name}) "
-                f"td[data-label=Type] .reclaim-space-modal-device-locked"
-            )
+            name_sub = json.dumps(name or location or "")
+            lock_cond = """(() => {
+              const table = document.querySelector(%s);
+              if (!table) return false;
+              const nameNeedle = %s;
+              for (const tr of table.querySelectorAll("tbody tr")) {
+                if (!tr.textContent.includes(nameNeedle)) continue;
+                const typeEl = tr.querySelector('td[data-label="Type"]');
+                if (typeEl && typeEl.querySelector(".reclaim-space-modal-device-locked")) return true;
+              }
+              return false;
+            })()""" % (json.dumps(self._TABLE), name_sub)
+            self.browser.wait_js_cond(lock_cond)
 
     def reclaim_remove_device(self, device):
-        self.browser.click(f"#reclaim-space-modal-table tr:contains('{device}') button[aria-label='delete']")
+        self._reclaim_click_row_button(device, "delete")
 
     def reclaim_check_action_button_present(self, device, action, present=True, disabled=False):
-        if action == "shrink":
-            disabled = ":disabled" if disabled else ":not(:disabled)"
-        else:
-            disabled = "[aria-disabled='true']" if disabled else ":not([aria-disabled='true'])"
-        selector = (
-            "#reclaim-space-modal-table "
-            f"tr:contains('{device}') "
-            f"button[aria-label='{action}']{disabled}"
-        )
-
-        if present:
-            self.browser.wait_visible(selector)
-        else:
-            self.browser.wait_not_present(selector)
+        if not present:
+            self._reclaim_wait_row_button(device, action, present=False, disabled=None)
+            return
+        want_dis = True if disabled else False
+        self._reclaim_wait_row_button(device, action, present=True, disabled=want_dis)
 
     def reclaim_modal_submit_and_check_warning(self, warning):
         self.browser.click("button:contains('Reclaim space')")
         self.browser.wait_in_text("#reclaim-space-modal .pf-v6-c-alert", warning)
 
     def reclaim_shrink_device(self, device, new_size, current_size=None, rowIndex=None, ariaLabel="shrink"):
-        self.browser.click(
-            "#reclaim-space-modal-table "
-            f"tbody{'' if rowIndex is None else f':nth-child({rowIndex})'} "
-            f"tr:contains('{device}') button[aria-label='{ariaLabel}']"
-        )
+        self._reclaim_click_row_button(device, ariaLabel, rowIndex=rowIndex)
         self.browser.wait_visible("#popover-reclaim-space-modal-shrink-body")
         if current_size is not None:
             self.browser.wait_val("#reclaim-space-modal-shrink-input", current_size)
@@ -577,19 +664,21 @@ class StorageReclaimDialog():
         self.reclaim_check_action_present(device, ariaLabel, rowIndex=rowIndex)
 
     def reclaim_check_action_present(self, device, action, present=True, rowIndex=None):
-        selector = (
-            "#reclaim-space-modal-table "
-            f"tbody{'' if rowIndex is None else f':nth-child({rowIndex})'} "
-            f"tr:contains('{device}') "
-            "td:nth-child(5) "  # Actions column
-        )
+        act = json.dumps(action)
+        inner = """
+            const actions = tr.querySelector("td:nth-child(5)");
+            if (!actions) continue;
+            const actionNeedle = %s;
+            if (actions.textContent.includes(actionNeedle)) return true;
+        """ % act
+        cond = self._reclaim_js_each_row(device, rowIndex, inner)
         if present:
-            self.browser.wait_in_text(selector, action)
+            self.browser.wait_js_cond(cond)
         else:
-            self.browser.wait_not_in_text(selector, action)
+            self.browser.wait_js_cond("!(" + cond + ")")
 
     def reclaim_undo_action(self, device):
-        self.browser.click(f"#reclaim-space-modal-table tr:contains('{device}') button[aria-label='undo']")
+        self._reclaim_click_row_button(device, "undo")
 
     def reclaim_check_available_space(self, space):
         self.browser.wait_text("#reclaim-space-modal-hint-available-free-space", space)
