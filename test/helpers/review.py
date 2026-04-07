@@ -1,6 +1,7 @@
 # Copyright (C) 2022 Red Hat, Inc.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+import json
 import os
 import sys
 
@@ -60,18 +61,48 @@ class Review(NetworkDBus, StorageDBus):
     ):
         action = f"format as {fs_type}" if reformat else action or "mount"
         encrypt_text = "encrypted" if is_encrypted and not reformat else "encrypt" if is_encrypted and reformat else ""
-        self.browser.wait_visible(
-            f"{prefix} table[aria-label={disk}] "
-            f"tbody{'' if rowIndex is None else f':nth-child({rowIndex})'} "
-            f"td:contains('{parent}') + "
-            f"td:contains('{size}') + "
-            f"td:contains('{action}') + "
-            f"td:contains('{encrypt_text}') + "
-            f"td:contains('{mount_point}')"
-        )
+        fragments = []
+        for part in (parent, str(size) if size != "" else "", action, encrypt_text, mount_point):
+            if part is not None and str(part) != "":
+                fragments.append(str(part))
+        table_selector = f"{prefix} #storage-review-table-{disk}".strip()
+        sel_json = json.dumps(table_selector)
+        frag_json = json.dumps(fragments)
+        if rowIndex is None:
+            cond = """(() => {
+              const table = document.querySelector(%s);
+              if (!table) return false;
+              const frags = %s;
+              const rows = table.querySelectorAll("tbody tr");
+              for (let i = 0; i < rows.length; i++) {
+                const t = rows[i].textContent;
+                if (frags.every(f => t.includes(f))) return true;
+              }
+              return false;
+            })()""" % (sel_json, frag_json)
+        else:
+            idx = int(rowIndex) - 1
+            cond = """(() => {
+              const table = document.querySelector(%s);
+              if (!table) return false;
+              const frags = %s;
+              const rows = table.querySelectorAll("tbody tr");
+              const tr = rows[%d];
+              if (!tr) return false;
+              const t = tr.textContent;
+              return frags.every(f => t.includes(f));
+            })()""" % (sel_json, frag_json, idx)
+        self.browser.wait_js_cond(cond)
 
     def check_disk_row_not_present(self, disk, mount):
-        self.browser.wait_not_present(f"table[aria-label={disk}] td:contains({mount})")
+        table_selector = f"#storage-review-table-{disk}".strip()
+        cond = """(() => {
+          const table = document.querySelector(%s);
+          if (!table) return true;
+          const needle = %s;
+          return !Array.from(table.querySelectorAll("tbody tr")).some(tr => tr.textContent.includes(needle));
+        })()""" % (json.dumps(table_selector), json.dumps(mount))
+        self.browser.wait_js_cond(cond)
 
     def check_deleted_system(self, os_name):
         self.browser.wait_in_text(f"#{self._step}-target-storage-note li", os_name)
