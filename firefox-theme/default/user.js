@@ -19,7 +19,7 @@ user_pref("devtools.inspector.showUserAgentStyles", true);
 // Don't have any startup page
 user_pref("browser.startup.page", 0);
 user_pref("browser.startup.homepage", "about:blank");
-user_pref("browser.startup.homepage_override.once", {});
+user_pref("browser.startup.homepage_override.once", "");
 
 // Hide the bookmarks
 user_pref("browser.toolbars.bookmarks.visibility", "never");
@@ -42,6 +42,16 @@ user_pref("datareporting.healthreport.uploadEnabled", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("toolkit.telemetry.unified", false);
 user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
+
+// Skip the first-run onboarding / terms of use screen (needed for the
+// Flatpak Firefox, which shows it even with trailhead.firstrun set).
+// Firefox 156+ gates the UI on the accepted ToU version and on a
+// "preonboarding" splash.
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.aboutwelcome.didSeeFinalScreen", true);
+user_pref("browser.preonboarding.enabled", false);
+user_pref("termsofuse.acceptedVersion", 4);
+user_pref("termsofuse.bypassNotification", true);
 
 // Don't show `Allow this site to open the PROTOCOL link with APPLICATION` dialog
 user_pref("network.protocol-handler.warn-external-default", false);

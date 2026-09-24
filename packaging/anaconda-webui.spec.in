@@ -25,6 +25,14 @@ BuildRequires: systemd-rpm-macros
 
 %define _unitdir /usr/lib/systemd/system
 
+# PROTOTYPE (boot.iso-without-firefox.rpm research spike): lets a build opt
+# out of the firefox.rpm Requires below (e.g. `mock --without firefox_rpm` /
+# `rpmbuild --without firefox_rpm`) when Firefox is meant to come only from a
+# pre-installed Flatpak baked into the image at build time - see
+# dockerfile/anaconda-iso-creator/lorax-build-webui.j2 in the anaconda repo.
+# Default is unchanged (firefox.rpm required), matching today's behavior.
+%bcond_without firefox_rpm
+
 Requires: cockpit-storaged
 Requires: cockpit-networkmanager
 Requires: cockpit-bridge >= %{cockpitver}
@@ -34,7 +42,7 @@ Requires: python3-bugzilla
 # Firefox dependency needs to be specified there as cockpit web-view does not have a hard dependency on Firefox as
 # it can often fall back to a diferent browser. This does not work in the limited installer
 # environment, so we need to make sure Firefox is available. Exclude on RHEL, only Flatpak version will be there.
-%if ! 0%{?rhel}
+%if ! 0%{?rhel} && %{with firefox_rpm}
 Requires: (slitherer if (%{webui_slitherer_spin_identities}) else firefox)
 %endif
 %if 0%{?fedora}

@@ -132,30 +132,91 @@ get_default_browser() {
 prepare_firefox_cmd() {
     INSTALLER_USER=$1
     INSTALLER_XDG_RUNTIME_DIR=$2
+    INSTALLER_HOME=$3
+
+    FIREFOX_THEME_DIR="/usr/share/anaconda/firefox-theme"
+    FIREFOX_FLATPAK_ID="org.mozilla.firefox"
+
+    # PROTOTYPE (boot.iso-without-firefox.rpm research spike): if Firefox is only
+    # available as a Flatpak (no firefox.rpm on the image), run it via `flatpak
+    # run` instead.
+    if ! command -v /usr/bin/firefox >/dev/null 2>&1 && command -v flatpak >/dev/null 2>&1 \
+        && flatpak info "${FIREFOX_FLATPAK_ID}" >/dev/null 2>&1; then
+        USE_FIREFOX_FLATPAK=1
+    else
+        USE_FIREFOX_FLATPAK=0
+    fi
 
     # prepare empty firefox profile dir with theme based on the passed profile id
-    # INSTALLER_XDG_RUNTIME_DIR is created by the caller before this runs.
-    FIREFOX_THEME_DIR="/usr/share/anaconda/firefox-theme"
-    FIREFOX_PROFILE_PATH="${INSTALLER_XDG_RUNTIME_DIR}/anaconda/firefox-profile"
+    if [ "${USE_FIREFOX_FLATPAK}" = "1" ]; then
+        # Flatpak ignores --filesystem grants for paths under /run/user/<uid>
+        # (it manages that directory itself), so keep the profile in Firefox's
+        # own persistent data directory, which the sandbox exposes by default.
+        FIREFOX_PROFILE_PATH="${INSTALLER_HOME}/.var/app/${FIREFOX_FLATPAK_ID}/.mozilla/firefox/anaconda"
+    else
+        # INSTALLER_XDG_RUNTIME_DIR is created by the caller before this runs.
+        FIREFOX_PROFILE_PATH="${INSTALLER_XDG_RUNTIME_DIR}/anaconda/firefox-profile"
+    fi
 
     # make sure the profile directory exists and is empty
-    if [ -d ${FIREFOX_PROFILE_PATH} ]
+    if [ -d "${FIREFOX_PROFILE_PATH}" ]
     then
         echo "Cleaning up existing Anaconda Firefox profile directory." >&2
-        rm -rf ${FIREFOX_PROFILE_PATH}
+        rm -rf "${FIREFOX_PROFILE_PATH}"
     fi
-    pkexec --user "${INSTALLER_USER}" mkdir -p ${FIREFOX_PROFILE_PATH}
+    pkexec --user "${INSTALLER_USER}" mkdir -p "${FIREFOX_PROFILE_PATH}"
 
     # populate the profile directory with our custom Firefox theme
     # - theme id is passed as the second argument of this script
     THEME_PATH="${FIREFOX_THEME_DIR}/${THEME_ID}"
 
-    pkexec --user "${INSTALLER_USER}" cp -a "${THEME_PATH}/." ${FIREFOX_PROFILE_PATH}
+    pkexec --user "${INSTALLER_USER}" cp -a "${THEME_PATH}/." "${FIREFOX_PROFILE_PATH}"
 
     # set environment for Firefox
     BROWSER_ENV=(MOZ_APP_TITLE="" MOZ_APP_REMOTINGNAME="liveinst" MOZ_GTK_TITLEBAR_DECORATION=client)
 
-    BROWSER=(/usr/bin/env "${BROWSER_ENV[@]}" /usr/bin/firefox --new-instance --profile "${FIREFOX_PROFILE_PATH}")
+    if [ "${USE_FIREFOX_FLATPAK}" = "1" ]; then
+        echo "firefox.rpm not found, using Firefox Flatpak (${FIREFOX_FLATPAK_ID})" >&2
+
+        # On a local boot.iso the Wayland compositor (gnome-kiosk) runs as root
+        # and its socket lives in /run/user/0, while the Flatpak browser runs as
+        # an unprivileged user. Flatpak's Wayland proxy cannot reach a socket
+        # outside the app's own runtime dir, and --nosocket=wayland clears
+        # WAYLAND_DISPLAY, so we cannot pass it via --env either. Bypass the
+        # proxy instead: disable the wayland/x11 sockets, expose the compositor
+        # socket, and set WAYLAND_DISPLAY from inside the sandbox via a small
+        # launcher. On live media (compositor in the user's own session) the
+        # standard Wayland socket works, so none of this is needed.
+        ROOT_XDG_RUNTIME_DIR="/run/user/0"
+        ROOT_WAYLAND_SOCKET="$(find "${ROOT_XDG_RUNTIME_DIR}" -maxdepth 1 -type s -name 'wl-sysinstall-*' 2>/dev/null | head -n 1)"
+
+        if [ -n "${ROOT_WAYLAND_SOCKET}" ]; then
+            FIREFOX_FLATPAK_LAUNCHER="${FIREFOX_PROFILE_PATH}/flatpak-launcher.sh"
+            cat > "${FIREFOX_FLATPAK_LAUNCHER}" <<'LAUNCHER'
+#!/bin/sh
+export WAYLAND_DISPLAY="${ANACONDA_WAYLAND_DISPLAY}"
+export GDK_BACKEND=wayland
+exec /app/bin/firefox --new-instance --profile "${ANACONDA_FIREFOX_PROFILE}" "$@"
+LAUNCHER
+            chmod 0755 "${FIREFOX_FLATPAK_LAUNCHER}"
+            chown "${INSTALLER_USER}" "${FIREFOX_FLATPAK_LAUNCHER}"
+
+            BROWSER=(/usr/bin/env "${BROWSER_ENV[@]}" flatpak run \
+                --nosocket=wayland --nosocket=x11 --nosocket=fallback-x11 \
+                --filesystem="${ROOT_WAYLAND_SOCKET}" \
+                --env=ANACONDA_WAYLAND_DISPLAY="${ROOT_WAYLAND_SOCKET}" \
+                --env=ANACONDA_FIREFOX_PROFILE="${FIREFOX_PROFILE_PATH}" \
+                --env=MOZ_ENABLE_WAYLAND=1 \
+                --command="${FIREFOX_FLATPAK_LAUNCHER}" \
+                "${FIREFOX_FLATPAK_ID}")
+        else
+            BROWSER=(/usr/bin/env "${BROWSER_ENV[@]}" flatpak run \
+                --env=MOZ_ENABLE_WAYLAND=1 \
+                "${FIREFOX_FLATPAK_ID}" --new-instance --profile "${FIREFOX_PROFILE_PATH}")
+        fi
+    else
+        BROWSER=(/usr/bin/env "${BROWSER_ENV[@]}" /usr/bin/firefox --new-instance --profile "${FIREFOX_PROFILE_PATH}")
+    fi
 
     declare -p BROWSER
 }
@@ -215,7 +276,8 @@ else
     DEFAULT_BROWSER_CMD=$(get_default_browser)
     echo "Using default browser: ${DEFAULT_BROWSER_CMD}" >&2
     if [[ "${DEFAULT_BROWSER_CMD}" == "firefox" ]]; then
-        eval "$(prepare_firefox_cmd "$INSTALLER_USER" "$INSTALLER_XDG_RUNTIME_DIR")"
+        INSTALLER_HOME=$(grep "^${INSTALLER_USER}:" /etc/passwd | cut -d: -f6)
+        eval "$(prepare_firefox_cmd "$INSTALLER_USER" "$INSTALLER_XDG_RUNTIME_DIR" "$INSTALLER_HOME")"
         echo "Using Firefox browser command: ${BROWSER[@]}" >&2
     else
         BROWSER=(${DEFAULT_BROWSER_CMD})
