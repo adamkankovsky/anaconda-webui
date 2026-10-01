@@ -9,9 +9,13 @@
 # storage              - storage related tests
 # cockpit              - storage related tests that utilize Cockpit Storage plugin
 # other                - all remaining tests
-# bios                 - tests in BIOS mode (they might be tests which are also present in other scenarios)
+# dnf                  - tests using the DNF payload
+# bios                 - tests in BIOS mode (the full test list is used, tests which do not support BIOS are skipped)
 # compose-{compose-id} - tests defined in wiki-testmap.json ran against given compose
 # bootoptns-net1       - tests run for installation with network configuration via boot options
+#
+# Scenarios can be combined with '-' (e.g. 'bios-storage'). An unrecognized
+# scenario is rejected instead of silently running the whole test suite.
 
 
 set -eux
@@ -68,8 +72,12 @@ case "${TEST_SCENARIO:=}" in
     *cockpit*)
         RUN_OPTS="$(echo "$BASIC_TESTS" | grep "Cockpit")"
         ;;
-    *)
+    "" | *all* | *bios* | *bootopts-net1*)
         RUN_OPTS="$ALL_TESTS"
+        ;;
+    *)
+        echo "ERROR: unknown TEST_SCENARIO: '${TEST_SCENARIO}'" >&2
+        exit 1
         ;;
 esac
 

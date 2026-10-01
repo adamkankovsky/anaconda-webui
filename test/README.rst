@@ -234,6 +234,8 @@ You can set these environment variables to configure the test suite::
                   of the Cockpit image server.
 
     TEST_SCENARIO A list of currently supported scenarios can be found in the `test/run` file.
+                  An unrecognized scenario is rejected instead of silently running the
+                  whole suite.
 
     TEST_BROWSER  What browser should be used for testing. Currently supported values:
                      "chromium"
