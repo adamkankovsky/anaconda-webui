@@ -1,6 +1,7 @@
 # Copyright (C) 2022 Red Hat, Inc.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+import json
 from collections import UserDict
 
 import steps
@@ -219,18 +220,28 @@ class Installer():
     def check_prerelease_info(self, is_expected=None):
         """ Checks whether the pre-release information is visible or not.
 
-        If is_expected is not set, the expected state is deduced from .buildstamp file.
+        If is_expected is not set, check the status reported by the backend.
+        Source selection is covered by backend tests; this checks its presentation.
 
         :param is_expected: Is it expected that the info is visible or not, defaults to None
         :type is_expected: bool, optional
         """
-        if is_expected is not None:
-            value = str(is_expected)
-        else:
-            value = self.machine.execute("grep IsFinal= /.buildstamp").split("=", 1)[1]
+        if is_expected is None:
+            # Match the frontend API, including support for older backends.
+            command = (
+                'busctl --json=short --address="$(cat /run/anaconda/bus.address)" get-property '
+                'org.fedoraproject.Anaconda.Modules.Runtime '
+                '/org/fedoraproject/Anaconda/Modules/Runtime/UserInterface '
+                'org.fedoraproject.Anaconda.Modules.Runtime.UserInterface '
+            )
+            result = json.loads(self.machine.execute(
+                f"{command} ProductData || {command} IsFinal"
+            ))["data"]
+            is_final = result["is-final-release"]["data"] if isinstance(result, dict) else result
+            is_expected = not is_final
 
         # Check betanag
-        if value.lower() == "false":
+        if is_expected:
             self.browser.wait_visible("#betanag-icon")
         else:
-            self.browser.wait_not_present("#betang-icon")
+            self.browser.wait_not_present("#betanag-icon")
